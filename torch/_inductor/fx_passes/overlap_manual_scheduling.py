@@ -107,8 +107,6 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
         new_waits = [n for n in new_nodes if _schedulable_wait_node(n)]
         assert len(new_waits) == 1, f"Expected exactly one new wait, got {new_waits}"
         new_wait = new_waits[0]
-        new_start = new_wait.args[0]
-        assert isinstance(new_start, fx.Node)
 
         # Set manual bucketing-specific metadata
         # Note: Generic metadata (nn_module_stack, fwd_nn_module_stack, custom, stack_trace)
@@ -214,6 +212,14 @@ class ManualOverlapScheduler(OverlapScheduler):
         # Bucket collectives in each bucket_module
         self._manual_bucket_collectives()
 
+        self.collective_priority = {}
+        priority_counter = 0
+        for sub_idx, subgraph in enumerate(self.nodes_in_subgraph):
+            for n in subgraph:
+                if n in self.collective_info:     # only collective start nodes
+                    self.collective_priority[n] = priority_counter
+                    priority_counter += 1
+
         # Reorder collectives with last/next bucket_module
         self._manual_reorder_graph()
 
@@ -229,6 +235,12 @@ class ManualOverlapScheduler(OverlapScheduler):
         """
         delayed_rs_nodes: list[fx.Node] = []
         overlap_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
+        self.ready: list[tuple[object, fx.Node]] = []
+
+        for node in self.nodes:
+            if self.in_degree[node] == 0:
+                priority = self.collective_priority.get(node, float("inf"))
+                heapq.heappush(self.ready, (priority, node))
 
         # schedule reduce scatter normally in self._schedule
         while self.ready:
@@ -317,7 +329,8 @@ class ManualOverlapScheduler(OverlapScheduler):
         for user in node.users:
             self.in_degree[user] -= 1
             if self.in_degree[user] == 0:
-                heapq.heappush(self.ready, ((), user))
+                priority = self.collective_priority.get(user, float("inf"))
+                heapq.heappush(self.ready, (priority, user))
 
     def _obtain_nodes_in_subgraph(self) -> None:
         """

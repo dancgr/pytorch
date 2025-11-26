@@ -104,6 +104,9 @@ class AotAutograd:
         self.kwargs["inference_compiler"] = (
             self.kwargs.get("inference_compiler") or self.kwargs["fw_compiler"]
         )
+        from functorch.compile import min_cut_rematerialization_partition
+        self.kwargs["partition_fn"] = min_cut_rematerialization_partition
+
 
         from functorch.compile import nop
         from torch._inductor.debug import enable_aot_logging
