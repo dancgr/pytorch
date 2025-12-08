@@ -36,26 +36,12 @@ import threading
 import types
 import warnings
 import weakref
-from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any, TYPE_CHECKING
 from typing_extensions import is_typeddict
 
 import torch._dynamo.config
 import torch.nn
-from torch._dynamo.variables.base import (
-    MutationType,
-    raise_type_error_exc,
-    ValueMutationNew,
-    VariableTracker,
-)
-from torch._dynamo.variables.constant import ConstantVariable
-from torch._dynamo.variables.dicts import (
-    ConstDictVariable,
-    DefaultDictVariable,
-    SetVariable,
-)
-from torch._dynamo.variables.lists import ListVariable, SizeVariable, TupleVariable
 from torch._guards import Source, TracingContext
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass_type
 
@@ -108,6 +94,9 @@ from ..utils import (
     tuple_methods,
     unpatched_nn_module_getattr,
 )
+from .base import MutationType, raise_type_error_exc, ValueMutationNew, VariableTracker
+from .dicts import ConstDictVariable, DefaultDictVariable, SetVariable
+from .lists import ListVariable, SizeVariable, TupleVariable
 
 
 try:
@@ -125,6 +114,7 @@ if TYPE_CHECKING:
     from torch._dynamo.codegen import PyCodegen
     from torch._dynamo.side_effects import SideEffects
     from torch._dynamo.symbolic_convert import InstructionTranslator
+    from torch._dynamo.variables.constant import ConstantVariable
 
 
 def is_standard_setattr(val: object) -> bool:
@@ -229,21 +219,22 @@ class UserDefinedClassVariable(UserDefinedVariable):
 
     @staticmethod
     @functools.cache
-    def supported_c_new_functions() -> set[object]:
-        exceptions = [
+    def supported_c_new_functions() -> set[Any]:
+        exceptions: set[Any] = {
             getattr(builtins, name).__new__
             for name in dir(builtins)
             if isinstance(getattr(builtins, name), type)
             and issubclass(getattr(builtins, name), BaseException)
-        ]
-        return {
+        }
+        c_new_fns: set[Any] = {
             object.__new__,
             dict.__new__,
             set.__new__,
             frozenset.__new__,
             tuple.__new__,
             list.__new__,
-        }.union(exceptions)  # type: ignore[arg-type]
+        }
+        return c_new_fns.union(exceptions)
 
     @staticmethod
     def is_supported_new_method(value: object) -> bool:
@@ -262,7 +253,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
         return key in self.value.__dict__
 
     def var_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
-        from . import EnumVariable
+        from . import ConstantVariable, EnumVariable
 
         source = AttrSource(self.source, name) if self.source is not None else None
 
@@ -360,6 +351,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
 
         non functional loss call: input, target, optional_output
         """
+        from . import ConstantVariable
 
         def normalize_args(
             weight: VariableTracker = ConstantVariable.create(None),
@@ -532,7 +524,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 mutation_type=ValueMutationNew(),
             )
         elif is_typeddict(self.value):
-            if getattr(self.value, "__optional_keys__", None):
+            if self.value.__optional_keys__:  # type: ignore[attr-defined]
                 unimplemented(
                     gb_type="TypedDict with optional keys",
                     context=str(self.value),
@@ -551,7 +543,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
             ) -> Any:
                 pass
 
-            bound_args = inspect.BoundArguments(inspect.Signature(), OrderedDict())
+            bound_args = None
             try:
                 bound_args = inspect.signature(deque_signature).bind(*args, **kwargs)
             except TypeError as e:
@@ -565,7 +557,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                     ],
                     from_exc=e,
                 )
-
+            assert bound_args is not None
             if "iterable" in bound_args.arguments:
                 if not bound_args.arguments["iterable"].has_force_unpack_var_sequence(
                     tx
@@ -733,7 +725,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                     )
                 items_ret_type: list[VariableTracker] = args[
                     0
-                ].force_unpack_var_sequence(tx)  # type: ignore[union-attr,attr-defined]
+                ].force_unpack_var_sequence(tx)
             else:
                 field_defaults = self.value._field_defaults  # type: ignore[attr-defined]
 
@@ -766,43 +758,39 @@ class UserDefinedClassVariable(UserDefinedVariable):
             return variables.NamedTupleVariable(
                 items_ret_type,
                 self.value,
-                mutation_type=AttributeMutationNew(),  # type: ignore[arg-type]
+                mutation_type=AttributeMutationNew(),
             )
         elif self.value is torch.Size:
             # This simulates `THPSize_pynew`, the C impl for `Size.__new__`.
             tup = variables.BuiltinVariable(tuple).call_function(tx, args, kwargs)
             return SizeVariable(tup.items)  # type: ignore[attr-defined]
         elif is_frozen_dataclass(self.value) and self.is_standard_new():
-            from dataclasses import Field
+            fields = dataclasses.fields(self.value)  # type: ignore[arg-type]
+            assert self.source is not None
+            fields_source = DataclassFieldsSource(self.source)
+            items = list(args)
+            items.extend([None] * (len(fields) - len(items)))  # type: ignore[arg-type]
 
-            fields_tuple: tuple[Field[Any], ...] = dataclasses.fields(self.value)  # type: ignore[arg-type,assignment]
-            fields_source = DataclassFieldsSource(self.source)  # type: ignore[arg-type]
-            items_list: list[VariableTracker | None] = list(args)
-            items_list.extend([None] * (len(fields_tuple) - len(items_list)))  # type: ignore[assignment,arg-type]
-
-            default_kwargs: dict[str, VariableTracker] = {}
-            for ind, field, var_tracker in zip(
-                itertools.count(), fields_tuple, items_list
-            ):
+            default_kwargs = {}
+            for ind, field, var_tracker in zip(itertools.count(), fields, items):
                 if var_tracker is None:
-                    if field.name in kwargs:  # type: ignore[union-attr,attr-defined]
-                        var_tracker = kwargs[field.name]  # type: ignore[union-attr,attr-defined]
+                    if field.name in kwargs:
+                        var_tracker = kwargs[field.name]
                     else:
-                        if not field.init:  # type: ignore[union-attr,attr-defined]
+                        if not field.init:
                             continue
 
-                        if field.default is not dataclasses.MISSING:  # type: ignore[union-attr,attr-defined]
+                        if field.default is not dataclasses.MISSING:
                             var_tracker = VariableTracker.build(
                                 tx,
-                                field.default,  # type: ignore[union-attr,attr-defined]
+                                field.default,
                                 source=AttrSource(
                                     GetItemSource(fields_source, ind), "default"
                                 ),
                             )
-                        elif field.default_factory is not dataclasses.MISSING:  # type: ignore[union-attr,attr-defined]
+                        elif field.default_factory is not dataclasses.MISSING:
                             factory_fn = VariableTracker.build(
-                                tx,
-                                field.default_factory,  # type: ignore[union-attr,attr-defined]
+                                tx, field.default_factory
                             )
                             var_tracker = factory_fn.call_function(tx, [], {})
                         else:
@@ -810,7 +798,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                             # be missing args
                             continue
 
-                    default_kwargs[field.name] = var_tracker  # type: ignore[union-attr,attr-defined]
+                    default_kwargs[field.name] = var_tracker
             kwargs.update(default_kwargs)
 
             var = tx.output.side_effects.track_new_user_defined_object(
@@ -844,6 +832,8 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 args = [stacked]
 
             if issubclass(self.value, torch.Stream):
+                from .constant import ConstantVariable
+
                 var_kwargs = ConstDictVariable(
                     {ConstantVariable(k): v for k, v in kwargs.items()}
                 )
@@ -868,6 +858,8 @@ class UserDefinedClassVariable(UserDefinedVariable):
                     ),
                 )
             elif issubclass(self.value, torch.Event):
+                from .constant import ConstantVariable
+
                 # Register newly created event for reconstruction
                 var_kwargs = ConstDictVariable(
                     {ConstantVariable(k): v for k, v in kwargs.items()}
@@ -938,7 +930,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
 
     def call_obj_hasattr(
         self, tx: "InstructionTranslator", name: str
-    ) -> ConstantVariable:
+    ) -> "ConstantVariable":
         if self.source:
             source = AttrSource(self.source, name)
             install_guard(source.make_guard(GuardBuilder.HASATTR))
@@ -1144,7 +1136,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         args: list[Any],
         kwargs: dict[str, Any],
     ) -> VariableTracker:
-        from . import UserMethodVariable
+        from . import ConstantVariable, UserMethodVariable
 
         method = self._maybe_get_baseclass_method(name)
         if method is not None:
@@ -1166,7 +1158,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
                 # TODO(anijain2305) - Identity checking should already be a part
                 # of the cmp_eq  polyfill function.
-                return ConstantVariable.create(self.value is other.value)  # type: ignore[union-attr]
+                return ConstantVariable.create(self.value is other.value)
 
             if torch._dynamo.config.enable_faithful_generator_behavior and isinstance(
                 self.value, types.GeneratorType
@@ -1488,6 +1480,8 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         )
 
     def var_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
+        from . import ConstantVariable
+
         source: Source | None = AttrSource(self.source, name) if self.source else None
 
         if object_has_getattribute(self.value):
@@ -1684,9 +1678,9 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             # owner - class object
             owner_var = UserDefinedClassVariable(type(self.value))
             return variables.UserMethodVariable(
-                subobj.__get__.__func__,
+                subobj.__get__.__func__,  # type: ignore[attr-defined]
                 descriptor_var,
-                source=descriptor_get_source,  # type: ignore[attr-defined]
+                source=descriptor_get_source,
             ).call_function(tx, [self, owner_var], {})
         elif isinstance(subobj, types.FunctionType) or (
             isinstance(subobj, types.MethodType)
@@ -1763,7 +1757,8 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         ):
             # Recalculate source for params/buffers
             if name in ("_buffers", "_parameters"):
-                source = UnspecializedParamBufferSource(self.source, name)  # type: ignore[arg-type]
+                assert self.source is not None
+                source = UnspecializedParamBufferSource(self.source, name)
             source = self._wrap_source(source)
 
         if subobj is not NO_SUCH_SUBOBJ:
@@ -1803,7 +1798,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
     def call_obj_hasattr(
         self, tx: "InstructionTranslator", name: str
-    ) -> ConstantVariable:
+    ) -> "ConstantVariable":
         if self.source:
             install_guard(
                 AttrSource(self.source, name).make_guard(GuardBuilder.HASATTR)
@@ -1854,6 +1849,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             # In optree, types can be registered globally (type in registry)
             # or with a namespace ((namespace, type) in registry)
             try:
+                # pyrefly: ignore[missing-import]
                 from optree.registry import _NODETYPE_REGISTRY
 
                 # Check if registered globally
@@ -2165,7 +2161,7 @@ class UserDefinedExceptionObjectVariable(UserDefinedObjectVariable):
         return super().call_method(tx, name, args, kwargs)
 
     @property
-    def __context__(self) -> ConstantVariable:
+    def __context__(self) -> "ConstantVariable":
         return self.exc_vt.__context__
 
     @property
@@ -2334,8 +2330,10 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
     def install_dict_keys_match_guard(self) -> None:
         return self._dict_vt.install_dict_keys_match_guard()
 
-    def install_dict_contains_guard(self) -> None:
-        return self._dict_vt.install_dict_contains_guard()  # type: ignore[call-arg]
+    def install_dict_contains_guard(
+        self, tx: "InstructionTranslator", args: list[VariableTracker]
+    ) -> None:
+        return self._dict_vt.install_dict_contains_guard(tx, args)
 
     def is_python_hashable(self):
         raise_on_overridden_hash(self.value, self)
@@ -2415,8 +2413,10 @@ class UserDefinedSetVariable(UserDefinedObjectVariable):
     def install_dict_keys_match_guard(self) -> None:
         return self._set_vt.install_dict_keys_match_guard()
 
-    def install_dict_contains_guard(self) -> None:
-        return self._set_vt.install_dict_contains_guard()  # type: ignore[call-arg]
+    def install_dict_contains_guard(
+        self, tx: "InstructionTranslator", args: list[VariableTracker]
+    ) -> None:
+        return self._set_vt.install_dict_contains_guard(tx, args)
 
     def is_python_hashable(self):
         raise_on_overridden_hash(self.value, self)
